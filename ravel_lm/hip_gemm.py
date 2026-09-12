@@ -134,8 +134,17 @@ extern "C" __global__ __launch_bounds__({THREADS}) void gemm_nt(
     #pragma unroll
     for (int i=0;i<TM;++i) {{
         int gm = tg_m + trow*TM + i; if (gm>=M) continue;
-        #pragma unroll
-        for (int j=0;j<TN;++j) {{ int gn = tg_n + tcol*TN + j; if (gn<N) C[gm*scm+gn]=acc[i][j]; }}
+        int gn0 = tg_n + tcol*TN;
+        if ((TN%4)==0 && gn0+TN<=N && (gn0&3)==0) {{
+            #pragma unroll
+            for (int j=0;j<TN;j+=4) {{
+                float4v o = {{acc[i][j],acc[i][j+1],acc[i][j+2],acc[i][j+3]}};
+                *((float4v*)(C + gm*scm + gn0 + j)) = o;
+            }}
+        }} else {{
+            #pragma unroll
+            for (int j=0;j<TN;++j) {{ int gn=gn0+j; if (gn<N) C[gm*scm+gn]=acc[i][j]; }}
+        }}
     }}
 }}
 """
@@ -191,8 +200,17 @@ extern "C" __global__ __launch_bounds__({THREADS}) void gemm_nn(
     #pragma unroll
     for (int i=0;i<TM;++i) {{
         int gm=tg_m+trow*TM+i; if(gm>=M) continue;
-        #pragma unroll
-        for (int j=0;j<TN;++j) {{ int gk=tg_k+tcol*TN+j; if(gk<Kc) C[gm*scm+gk]=acc[i][j]; }}
+        int gk0=tg_k+tcol*TN;
+        if ((TN%4)==0 && gk0+TN<=Kc && (gk0&3)==0) {{
+            #pragma unroll
+            for (int j=0;j<TN;j+=4) {{
+                float4v o = {{acc[i][j],acc[i][j+1],acc[i][j+2],acc[i][j+3]}};
+                *((float4v*)(C + gm*scm + gk0 + j)) = o;
+            }}
+        }} else {{
+            #pragma unroll
+            for (int j=0;j<TN;++j) {{ int gk=gk0+j; if(gk<Kc) C[gm*scm+gk]=acc[i][j]; }}
+        }}
     }}
 }}
 """
@@ -255,6 +273,93 @@ extern "C" __global__ __launch_bounds__({THREADS}) void gemm_dw(
 """
 
 
+
+# Double-buffered NT GEMM: prefetch next K-tile into registers during compute,
+# hiding global-load latency. Same math/result as gemm_nt.
+_SRC_NT_DB = r"""
+typedef float float4v __attribute__((ext_vector_type(4)));
+extern "C" __global__ __launch_bounds__({THREADS}) void gemm_nt_db(
+    const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C,
+    int M, int N, int K, int scm)
+{{
+    const int BM={BM}, BN={BN}, BK={BK}, TM={TM}, TN={TN}, THREADS={THREADS};
+    __shared__ float As[2][BK][BM];
+    __shared__ float Bs[2][BK][BN];
+    const int tx=threadIdx.x; const int threadsN=BN/TN;
+    const int trow=tx/threadsN, tcol=tx%threadsN;
+    const int tg_m=blockIdx.y*BM, tg_n=blockIdx.x*BN;
+    const int K4=K>>2;
+    const int na=BM*(BK/4), nb=BN*(BK/4);
+    float acc[TM][TN];
+    #pragma unroll
+    for(int i=0;i<TM;++i) for(int j=0;j<TN;++j) acc[i][j]=0.0f;
+    // preload tile 0
+    for(int idx=tx; idx<na; idx+=THREADS){{
+        int m=idx/(BK/4), k4=idx%(BK/4); int gm=tg_m+m;
+        float4v v=(gm<M)?((const float4v*)A)[gm*K4+k4]:float4v{{0,0,0,0}};
+        As[0][k4*4+0][m]=v.x;As[0][k4*4+1][m]=v.y;As[0][k4*4+2][m]=v.z;As[0][k4*4+3][m]=v.w;
+    }}
+    for(int idx=tx; idx<nb; idx+=THREADS){{
+        int n=idx/(BK/4), k4=idx%(BK/4); int gn=tg_n+n;
+        float4v v=(gn<N)?((const float4v*)B)[gn*K4+k4]:float4v{{0,0,0,0}};
+        Bs[0][k4*4+0][n]=v.x;Bs[0][k4*4+1][n]=v.y;Bs[0][k4*4+2][n]=v.z;Bs[0][k4*4+3][n]=v.w;
+    }}
+    __syncthreads();
+    int cur=0;
+    const int ntiles=(K+BK-1)/BK;
+    for(int t=0;t<ntiles;++t){{
+        int nxt=1-cur;
+        float4v ra[ (na+THREADS-1)/THREADS ];
+        float4v rb[ (nb+THREADS-1)/THREADS ];
+        int cnt_a=0, cnt_b=0;
+        if(t+1<ntiles){{
+            int k0n=(t+1)*BK;
+            for(int idx=tx; idx<na; idx+=THREADS){{
+                int m=idx/(BK/4), k4=idx%(BK/4); int gm=tg_m+m;
+                ra[cnt_a++]=(gm<M)?((const float4v*)A)[gm*K4+(k0n/4)+k4]:float4v{{0,0,0,0}};
+            }}
+            for(int idx=tx; idx<nb; idx+=THREADS){{
+                int n=idx/(BK/4), k4=idx%(BK/4); int gn=tg_n+n;
+                rb[cnt_b++]=(gn<N)?((const float4v*)B)[gn*K4+(k0n/4)+k4]:float4v{{0,0,0,0}};
+            }}
+        }}
+        #pragma unroll
+        for(int k=0;k<BK;++k){{
+            float ar[TM], br[TN];
+            #pragma unroll
+            for(int i=0;i<TM;++i) ar[i]=As[cur][k][trow*TM+i];
+            #pragma unroll
+            for(int j=0;j<TN;++j) br[j]=Bs[cur][k][tcol*TN+j];
+            #pragma unroll
+            for(int i=0;i<TM;++i) for(int j=0;j<TN;++j) acc[i][j]+=ar[i]*br[j];
+        }}
+        if(t+1<ntiles){{
+            cnt_a=0;
+            for(int idx=tx; idx<na; idx+=THREADS){{
+                int m=idx/(BK/4), k4=idx%(BK/4);
+                float4v v=ra[cnt_a++];
+                As[nxt][k4*4+0][m]=v.x;As[nxt][k4*4+1][m]=v.y;As[nxt][k4*4+2][m]=v.z;As[nxt][k4*4+3][m]=v.w;
+            }}
+            cnt_b=0;
+            for(int idx=tx; idx<nb; idx+=THREADS){{
+                int n=idx/(BK/4), k4=idx%(BK/4);
+                float4v v=rb[cnt_b++];
+                Bs[nxt][k4*4+0][n]=v.x;Bs[nxt][k4*4+1][n]=v.y;Bs[nxt][k4*4+2][n]=v.z;Bs[nxt][k4*4+3][n]=v.w;
+            }}
+            __syncthreads();
+            cur=nxt;
+        }}
+    }}
+    #pragma unroll
+    for(int i=0;i<TM;++i){{
+        int gm=tg_m+trow*TM+i; if(gm>=M) continue;
+        #pragma unroll
+        for(int j=0;j<TN;++j){{ int gn=tg_n+tcol*TN+j; if(gn<N) C[gm*scm+gn]=acc[i][j]; }}
+    }}
+}}
+"""
+
+
 @functools.lru_cache(maxsize=64)
 def _kernel(BM, BN, BK, TM, TN) -> Kernel:
     threads = (BM // TM) * (BN // TN)
@@ -267,6 +372,13 @@ def _kernel_nt(BM, BN, BK, TM, TN) -> Kernel:
     threads = (BM // TM) * (BN // TN)
     src = _SRC_NT.format(BM=BM, BN=BN, BK=BK, TM=TM, TN=TN, THREADS=threads)
     return compile_kernel(src, "gemm_nt", options=())
+
+
+@functools.lru_cache(maxsize=64)
+def _kernel_nt_db(BM, BN, BK, TM, TN) -> Kernel:
+    threads = (BM // TM) * (BN // TN)
+    src = _SRC_NT_DB.format(BM=BM, BN=BN, BK=BK, TM=TM, TN=TN, THREADS=threads)
+    return compile_kernel(src, "gemm_nt_db", options=())
 
 
 @functools.lru_cache(maxsize=64)
@@ -362,11 +474,11 @@ def gemm_full(a, b, M, N, K, sam, sak, sbk, sbn, out, accumulate=False):
 
 _CFG_NT_DEFAULT = (64, 64, 16, 4, 4)
 _CFG_NT_TABLE = {
-    (160, 320): (128, 32, 8, 8, 4),
-    (160, 640): (64, 128, 8, 8, 4),
+    (160, 320): (64, 32, 8, 4, 8),
+    (160, 640): (128, 64, 8, 8, 8),
     (320, 160): (32, 32, 8, 4, 4),
     (160, 160): (64, 32, 8, 4, 4),
-    (96, 160): (64, 32, 8, 4, 4),
+    (96, 160): (32, 32, 8, 4, 4),
     (640, 160): (64, 32, 8, 4, 4),
     (160, 96): (64, 32, 8, 4, 4),
 }
@@ -395,11 +507,11 @@ def set_nt_config_table(table: dict):
 
 _CFG_NN_DEFAULT = (64, 64, 16, 4, 4)
 _CFG_NN_TABLE = {
-    (320, 160): (64, 32, 8, 4, 4),
+    (320, 160): (64, 64, 8, 8, 4),
     (640, 160): (64, 32, 8, 4, 4),
     (160, 160): (64, 32, 8, 4, 4),
     (160, 320): (64, 64, 8, 8, 4),
-    (160, 640): (64, 128, 8, 8, 4),
+    (160, 640): (64, 128, 8, 8, 8),
 }
 
 

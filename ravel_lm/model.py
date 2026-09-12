@@ -530,7 +530,10 @@ class RavelLM(nn.Module):
         for block in self.blocks:
             x = block(x, idx, write_mask=write_mask, literal_addr=literal_addr)
         x = self.norm(x)
-        logits = self.lm_head(x)
+        if x.is_cuda and x.dtype == torch.float32:
+            logits = fast_linear(x, self.lm_head.weight)
+        else:
+            logits = self.lm_head(x)
         out = {"logits": logits}
         if targets is not None:
             loss = F.cross_entropy(
