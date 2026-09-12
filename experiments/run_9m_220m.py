@@ -128,6 +128,10 @@ def run_arm(arm, steps, train_tok, eval_tok, offsets, eval_offsets):
             curve.append({"step": stp, "eval_nll": nll})
             el = time.perf_counter() - t0
             print(f"[{arm}] step {stp:6d}/{steps} eval_nll {nll:.4f}  ({el/max(1,stp+1)*1000:.2f} ms/step, {el/60:.1f} min elapsed)", flush=True)
+            _partial = json.loads(OUT.read_text()) if OUT.exists() else {}
+            _partial[arm] = {"arm": arm, "final_nll": nll, "curve": curve,
+                             "params": model.num_parameters, "step": stp, "graphed": graphed}
+            OUT.write_text(json.dumps(_partial, indent=2))
     wall = time.perf_counter() - t0
     res = {"arm": arm, "final_nll": curve[-1]["eval_nll"], "curve": curve,
            "params": model.num_parameters, "steps": steps, "tokens": steps * T,
