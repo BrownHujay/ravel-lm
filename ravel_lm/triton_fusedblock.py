@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import torch
 
-from .deferred import _STASH
+from .deferred import _STASH, accum_dw
 
 try:
     import triton
@@ -91,11 +91,11 @@ class _FusedFFNFn(torch.autograd.Function):
         M, HH = h.shape
         H = HH // 2
         dy = _lin_dx(gy2, w3)
-        _STASH.append((w3, y, gy2))
+        accum_dw(w3, y, gy2)
         dh = torch.empty_like(h)
         _silu_gate_bwd_kernel[(M, triton.cdiv(H, 128))](h, dy, dh, M, H, BH=128)
         dxn = _lin_dx(dh, w12)
-        _STASH.append((w12, xn, dh))
+        accum_dw(w12, xn, dh)
         dg = torch.zeros_like(norm_g)
         dx = _rms_bwd_into(x2, norm_g, dxn, rstd, dg)
         dx += gy2
@@ -132,7 +132,7 @@ class _FusedMixerFn(torch.autograd.Function):
         B, T, D = ctx.btd
         gy2 = gy.reshape(-1, gy.shape[-1]).contiguous()
         dy = _lin_dx(gy2, out_w)
-        _STASH.append((out_w, y2, gy2))
+        accum_dw(out_w, y2, gy2)
         uv3 = uv.view(B, T, 2 * D)
         guv = torch.empty_like(uv3)
         g = torch.empty(B, T, D, device=uv.device, dtype=uv.dtype)
@@ -144,7 +144,7 @@ class _FusedMixerFn(torch.autograd.Function):
             uv3, conv_w, g, guv, dw, db, T, D, BLOCK_T=64, BLOCK_D=64)
         guv2 = guv.view(B * T, 2 * D)
         dxn = _lin_dx(guv2, in_w)
-        _STASH.append((in_w, xn, guv2))
+        accum_dw(in_w, xn, guv2)
         dg = torch.zeros_like(norm_g)
         dx = _rms_bwd_into(x2, norm_g, dxn, rstd, dg)
         dx += gy2
@@ -219,7 +219,7 @@ class _FusedMemoryFn(torch.autograd.Function):
         _gate_res_bwd_kernel[(triton.cdiv(n, 1024),)](
             gate_lin, fused, gy2, dgl, dfused, n, BLOCK=1024)
         dread = _lin_dx(dfused, fuse_w)
-        _STASH.append((fuse_w, read_flat, dfused))
+        accum_dw(fuse_w, read_flat, dfused)
         N = M * C
         dpayload = dread.new_zeros(N, P)
         BD = max(16, triton.next_power_of_2(P))
@@ -230,7 +230,7 @@ class _FusedMemoryFn(torch.autograd.Function):
             pieces.append(dgl.new_zeros(M, addr_cols))
         dpacked = torch.cat(pieces, dim=1)
         dxn = _lin_dx(dpacked, w_cat)
-        _STASH.append((list(ctx.weights), xn, dpacked))
+        accum_dw(list(ctx.weights), xn, dpacked)
         dgate_b = dgl.sum(dim=0)
         dg = torch.zeros_like(norm_g)
         dx = _rms_bwd_into(x2, norm_g, dxn, rstd, dg)

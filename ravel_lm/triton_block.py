@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import torch
 
-from .deferred import _STASH
+from .deferred import _STASH, accum_dw
 
 try:
     import triton
@@ -152,7 +152,19 @@ _CFG_TABLE = {
 }
 
 
+try:
+    from . import hip_gemm as _hipg
+
+    _HAS_HIP = _hipg.gemm_available()
+except Exception:  # pragma: no cover
+    _HAS_HIP = False
+
+USE_HIP_GEMM = _HAS_HIP  # native HIP GEMM beats rocBLAS and Triton on RDNA4/Windows
+
+
 def _tgemm(a: Tensor, b_ptr_tensor: Tensor, M, N, K, sbk, sbn, out=None) -> Tensor:
+    if USE_HIP_GEMM:
+        return _hipg.gemm(a.contiguous(), b_ptr_tensor, M, N, K, sbk, sbn, out=out)
     c = out if out is not None else a.new_empty(M, N)
     BM, BN, BK, G, W = _CFG_TABLE.get((K, N), _CFG_DEFAULT)
     grid = (triton.cdiv(M, BM) * triton.cdiv(N, BN),)
@@ -189,7 +201,7 @@ class _FastLinearFn(torch.autograd.Function):
         M, N = gy2.shape
         K = weight.shape[1]
         dx = _tgemm(gy2, weight, M, K, N, weight.stride(0), weight.stride(1))
-        _STASH.append((weight, x2, gy2))
+        accum_dw(weight, x2, gy2)
         return dx.view(ctx.in_shape), None
 
 
@@ -250,7 +262,7 @@ class _FastLinearPackedFn(torch.autograd.Function):
         M, N = gy2.shape
         K = w_cat.shape[1]
         dx = _tgemm(gy2, w_cat, M, K, N, w_cat.stride(0), w_cat.stride(1))
-        _STASH.append((list(ctx.weights), x2, gy2))
+        accum_dw(list(ctx.weights), x2, gy2)
         return (dx.view(ctx.in_shape), None) + (None,) * len(ctx.weights)
 
 
