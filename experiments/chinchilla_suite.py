@@ -30,7 +30,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-ROOT = Path("/Users/kotnewm/Documents/GitHub/ravel_lm_project")
+ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from ravel_lm.config import RavelConfig

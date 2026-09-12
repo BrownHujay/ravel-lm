@@ -63,7 +63,9 @@ class FlatAdamW:
         betas: tuple[float, float] = (0.9, 0.95),
         eps: float = 1e-8,
         fused: bool = True,
+        capturable: bool = False,
     ) -> None:
+        self._capturable = capturable
         self._flat_params: list[torch.nn.Parameter] = []
         self._flat_grads: list[torch.Tensor] = []
         self._group_specs: list[dict] = []
@@ -92,7 +94,9 @@ class FlatAdamW:
             inner_groups.append(
                 {"params": [flat_param], "weight_decay": group.get("weight_decay", 0.0)}
             )
-        self._inner = torch.optim.AdamW(inner_groups, lr=lr, betas=betas, eps=eps, fused=fused)
+        self._inner = torch.optim.AdamW(
+            inner_groups, lr=lr, betas=betas, eps=eps, fused=fused, capturable=capturable
+        )
 
     @property
     def param_groups(self):

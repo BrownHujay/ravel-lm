@@ -6,6 +6,7 @@ from typing import Optional, Tuple
 import torch
 
 from .mps_memory import can_use_mps_latest1, mps_latest1_lookup
+from .triton_latest1 import can_use_triton_latest1_v2, triton_latest1_v2_lookup
 from .triton_memory import can_use_triton_latest1, triton_causal_latest1_lookup
 
 
@@ -94,6 +95,16 @@ def causal_last_k_lookup(
         raise ValueError("payloads leading dimensions must match addresses")
     if k <= 0:
         raise ValueError("k must be positive")
+    if can_use_triton_latest1_v2(
+        write_addresses, payloads, read_addresses,
+        address_space=address_space, k=k, write_mask=write_mask,
+    ):
+        return triton_latest1_v2_lookup(
+            write_addresses,
+            payloads,
+            read_addresses if read_addresses is not None else write_addresses,
+            address_space=address_space,
+        )
     if can_use_triton_latest1(write_addresses, payloads, read_addresses, k=k, write_mask=write_mask):
         return triton_causal_latest1_lookup(
             write_addresses,

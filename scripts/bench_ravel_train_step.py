@@ -16,6 +16,7 @@ if str(ROOT) not in sys.path:
 
 from ravel_lm.config import RavelConfig
 from ravel_lm.model import RavelLM
+from ravel_lm.deferred import defer_linear_wgrads, flush_deferred
 from ravel_lm.runtime import FlatAdamW, adamw_fused_for
 
 
@@ -44,6 +45,8 @@ def main() -> None:
     p.add_argument("--enable-triton-memory", action="store_true")
     p.add_argument("--enable-triton-fused-memory", action="store_true")
     p.add_argument("--mps-local", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--defer-wgrads", action="store_true",
+                   help="Batch same-shape weight-grad GEMMs after backward (CUDA/ROCm)")
     args = p.parse_args()
     if args.enable_triton_memory:
         os.environ["RAVEL_ENABLE_TRITON_MEMORY"] = "1"
@@ -60,6 +63,9 @@ def main() -> None:
     cfg.validate()
 
     model = RavelLM(deepcopy(cfg)).to(device)
+    if args.defer_wgrads:
+        n = defer_linear_wgrads(model)
+        print(f"deferred wgrad linears: {n}")
     for block in model.blocks:
         block.local.use_mps_local = args.mps_local
     exec_model = (
@@ -89,6 +95,8 @@ def main() -> None:
         opt.zero_grad()
         loss = exec_model(x, y)["loss"]
         loss.backward()
+        if args.defer_wgrads:
+            flush_deferred()
         opt.clip_grad_norm_(1.0)
         opt.step()
         sync(device)
