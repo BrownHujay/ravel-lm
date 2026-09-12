@@ -9,6 +9,7 @@ import torch.nn.functional as F
 
 from .config import RavelConfig
 from .ravel_memory import RavelLayerCache, causal_last_k_lookup, causal_sum_lookup
+from .triton_local import can_use_triton_local_gate, triton_local_gate
 from .triton_memory import can_use_triton_fused_latest1, triton_fused_latest1_linear
 
 if hasattr(torch.mps, "compile_shader"):
@@ -95,7 +96,9 @@ class LocalMixer(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         uv = self.in_proj(self.norm(x))
-        if (self.use_mps_local and local_gate is not None and uv.device.type == "mps"
+        if self.conv.kernel_size == 7 and can_use_triton_local_gate(uv, self.conv.weight):
+            y = triton_local_gate(uv, self.conv.weight, self.conv.bias)
+        elif (self.use_mps_local and local_gate is not None and uv.device.type == "mps"
                 and uv.dtype == torch.float32 and self.conv.kernel_size == 7):
             y = local_gate(uv, self.conv.weight, self.conv.bias)
         else:
