@@ -23,6 +23,7 @@ _STASH: List[Tuple[nn.Parameter, Tensor, Tensor]] = []
 # static ``.grad`` buffers (graph-capture friendly). When False, they are
 # stashed and batched by ``flush_deferred`` (lower launch count in eager mode).
 INLINE_DW = False
+INLINE_DW_TORCH = False  # inline dW via rocBLAS mm (no stack), graph-friendly
 
 
 def _ensure_grad(w: Tensor) -> Tensor:
@@ -34,6 +35,18 @@ def _ensure_grad(w: Tensor) -> Tensor:
 def accum_dw(weight, x2: Tensor, gy2: Tensor) -> None:
     """Accumulate dW = gy2^T @ x2 into weight.grad (single weight or a list of
     row-stacked weights sharing input x2). Inline HIP path or deferred stash."""
+    if INLINE_DW_TORCH:
+        if isinstance(weight, (list, tuple)):
+            row = 0
+            for w in weight:
+                n = w.shape[0]
+                if w.requires_grad:
+                    g = _ensure_grad(w)
+                    g.add_(gy2[:, row:row + n].t() @ x2)
+                row += n
+        else:
+            _ensure_grad(weight).add_(gy2.t() @ x2)
+        return
     if not INLINE_DW:
         _STASH.append((weight, x2, gy2))
         return

@@ -164,6 +164,12 @@ USE_HIP_GEMM = _HAS_HIP  # native HIP GEMM beats rocBLAS and Triton on RDNA4/Win
 
 def _tgemm(a: Tensor, b_ptr_tensor: Tensor, M, N, K, sbk, sbn, out=None) -> Tensor:
     if USE_HIP_GEMM:
+        # sbk==1 => B is [N,K] contiguous along K (nn.Linear forward, "NT"):
+        # use the float4-vectorized NT kernel. dX/dW have sbk!=1 -> general.
+        if sbk == 1 and a.is_contiguous():
+            return _hipg.gemm_nt(a, b_ptr_tensor, M, N, K, out=out)
+        if sbn == 1 and a.is_contiguous():
+            return _hipg.gemm_nn(a, b_ptr_tensor, M, N, K, out=out)
         return _hipg.gemm(a.contiguous(), b_ptr_tensor, M, N, K, sbk, sbn, out=out)
     c = out if out is not None else a.new_empty(M, N)
     BM, BN, BK, G, W = _CFG_TABLE.get((K, N), _CFG_DEFAULT)
