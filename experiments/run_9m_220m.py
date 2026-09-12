@@ -58,12 +58,22 @@ def load_bytes(p):
     return np.frombuffer(Path(p).read_bytes(), dtype=np.uint8)
 
 
-def run_arm(arm, steps, train_tok, eval_tok, offsets, eval_offsets):
+def run_arm(arm, steps, train_tok, eval_tok, offsets, eval_offsets, chunk=0):
     model, cfg = build(arm)
     params = [q for q in model.parameters() if q.requires_grad]
     opt = FlatAdamW([{"params": params, "weight_decay": 0.1}], lr=LR, betas=(0.9, 0.95), capturable=True)
     lr_t = torch.tensor(LR, device=DEV)
     opt._inner.param_groups[0]["lr"] = lr_t  # in-place updatable under graph
+    ckpt_path = Path(__file__).parent / f"{arm}_ckpt.pt"
+    start_step = 0
+    curve = []
+    if ckpt_path.exists():
+        ck = torch.load(ckpt_path, map_location=DEV)
+        model.load_state_dict(ck["model"])
+        opt._inner.load_state_dict(ck["opt"])
+        start_step = ck["step"]
+        curve = ck["curve"]
+        print(f"[{arm}] resumed at step {start_step}", flush=True)
 
     x = torch.zeros(1, T, dtype=torch.long, device=DEV)
     y = torch.zeros(1, T, dtype=torch.long, device=DEV)
@@ -89,12 +99,13 @@ def run_arm(arm, steps, train_tok, eval_tok, offsets, eval_offsets):
             for _ in range(5):
                 step()
         torch.cuda.current_stream().wait_stream(s); torch.cuda.synchronize()
-        # reset to init after warmup
-        _m2, _ = build(arm)
-        with torch.no_grad():
-            for pn, pf in zip(model.parameters(), _m2.parameters()):
-                pn.copy_(pf)
-        del _m2
+        if start_step == 0:
+            # reset to init after warmup (only on a fresh run)
+            _m2, _ = build(arm)
+            with torch.no_grad():
+                for pn, pf in zip(model.parameters(), _m2.parameters()):
+                    pn.copy_(pf)
+            del _m2
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
             static_loss = step()
@@ -114,9 +125,9 @@ def run_arm(arm, steps, train_tok, eval_tok, offsets, eval_offsets):
         return sum(ls) / len(ls)
 
     warmup = steps // 20
-    curve = []
+    end_step = min(steps, start_step + chunk) if chunk else steps
     t0 = time.perf_counter()
-    for stp in range(steps):
+    for stp in range(start_step, end_step):
         lr_t.fill_(lr_at(stp, steps, warmup))
         load(train_tok, int(offsets[stp]))
         if graphed:
@@ -133,14 +144,20 @@ def run_arm(arm, steps, train_tok, eval_tok, offsets, eval_offsets):
                              "params": model.num_parameters, "step": stp, "graphed": graphed}
             OUT.write_text(json.dumps(_partial, indent=2))
     wall = time.perf_counter() - t0
-    res = {"arm": arm, "final_nll": curve[-1]["eval_nll"], "curve": curve,
-           "params": model.num_parameters, "steps": steps, "tokens": steps * T,
-           "graphed": graphed, "wall_s": round(wall, 1),
-           "ms_per_step": round(wall / steps * 1000, 3)}
+    done_full = (end_step >= steps)
+    # checkpoint
+    torch.save({"model": model.state_dict(), "opt": opt._inner.state_dict(),
+                "step": end_step, "curve": curve}, ckpt_path)
     all_res = json.loads(OUT.read_text()) if OUT.exists() else {}
-    all_res[arm] = res
+    all_res[arm] = {"arm": arm, "final_nll": curve[-1]["eval_nll"] if curve else None,
+                    "curve": curve, "params": model.num_parameters, "step": end_step,
+                    "steps": steps, "graphed": graphed, "done": done_full,
+                    "ms_per_step_chunk": round(wall / max(1, end_step - start_step) * 1000, 3)}
     OUT.write_text(json.dumps(all_res, indent=2))
-    print(f"[{arm}] DONE final_nll {res['final_nll']:.4f}  {res['ms_per_step']:.2f} ms/step  {wall/60:.1f} min", flush=True)
+    tag = "DONE" if done_full else f"chunk -> step {end_step}"
+    print(f"[{arm}] {tag}  nll {curve[-1]['eval_nll'] if curve else 0:.4f}  "
+          f"{wall/max(1,end_step-start_step)*1000:.2f} ms/step  {wall/60:.1f} min", flush=True)
+    return done_full
 
 
 def main():
@@ -148,17 +165,22 @@ def main():
     ap.add_argument("--tokens", type=int, default=220_000_000)
     ap.add_argument("--arms", default="nope_chimex,full3")
     ap.add_argument("--smoke", type=int, default=0)
+    ap.add_argument("--chunk", type=int, default=0)
+    ap.add_argument("--one-chunk", action="store_true")
     args = ap.parse_args()
     steps = args.smoke if args.smoke else args.tokens // T
     train_tok = load_bytes(TRAIN); eval_tok = load_bytes(EVAL)
     rng = np.random.default_rng(2026)
     offsets = rng.integers(0, len(train_tok) - (T + 1), size=steps)
     eval_offsets = np.random.default_rng(7).integers(0, len(eval_tok) - (T + 1), size=EVAL_WINDOWS)
-    done = set(json.loads(OUT.read_text()).keys()) if (OUT.exists() and not args.smoke) else set()
+    res = json.loads(OUT.read_text()) if (OUT.exists() and not args.smoke) else {}
     for arm in args.arms.split(","):
-        if arm in done:
+        if res.get(arm, {}).get("done"):
             print(f"skip {arm} (done)", flush=True); continue
-        run_arm(arm, steps, train_tok, eval_tok, offsets, eval_offsets)
+        finished = run_arm(arm, steps, train_tok, eval_tok, offsets, eval_offsets, chunk=args.chunk)
+        if args.one_chunk and not finished:
+            print(f"[driver] {arm} chunk complete, more remain", flush=True)
+            break
 
 
 if __name__ == "__main__":
