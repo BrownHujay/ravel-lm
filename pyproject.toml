@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ravel-lm"
+version = "0.1.0"
+description = "RAVEL: exact addressed event-memory language model in PyTorch"
+requires-python = ">=3.10"
+dependencies = [
+  "torch>=2.1",
+  "numpy>=1.23",
+]
+
+[project.optional-dependencies]
+data = ["datasets>=2.18"]
+dev = ["pytest>=7.0"]
+
+[tool.setuptools.packages.find]
+include = ["ravel_lm*"]
+
+[tool.setuptools.package-data]
+ravel_lm = ["metal/*.metal"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]

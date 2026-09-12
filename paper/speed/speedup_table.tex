@@ -1,0 +1,20 @@
+\begin{tabular}{llrrrr}
+\toprule
+Sweep & Mode & $B$ & $T$ & Tokens/step & RAVEL speedup \\
+\midrule
+context & compiled & 8 & 128 & 1024 & 1.13$\times$ \\
+context & compiled & 4 & 256 & 1024 & 0.89$\times$ \\
+context & compiled & 2 & 512 & 1024 & 2.13$\times$ \\
+context & compiled & 1 & 1024 & 1024 & 3.94$\times$ \\
+context & eager & 8 & 128 & 1024 & 1.01$\times$ \\
+context & eager & 4 & 256 & 1024 & 1.38$\times$ \\
+context & eager & 2 & 512 & 1024 & 2.40$\times$ \\
+context & eager & 1 & 1024 & 1024 & 3.53$\times$ \\
+tokens & compiled & 1 & 512 & 512 & 1.74$\times$ \\
+tokens & compiled & 2 & 512 & 1024 & 2.13$\times$ \\
+tokens & compiled & 4 & 512 & 2048 & 2.62$\times$ \\
+tokens & eager & 1 & 512 & 512 & 1.66$\times$ \\
+tokens & eager & 2 & 512 & 1024 & 2.41$\times$ \\
+tokens & eager & 4 & 512 & 2048 & 2.75$\times$ \\
+\bottomrule
+\end{tabular}

@@ -1,0 +1,6 @@
+torch>=2.1
+numpy>=1.23
+# Optional for Hugging Face TinyStories streaming:
+datasets>=2.18
+# Optional for tests:
+pytest>=7.0

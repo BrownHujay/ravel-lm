@@ -1,0 +1,16 @@
+{
+  "run_dir": "runs/tinystories_comparison_200k_compiled_speedfix",
+  "out_dir": "paper/full/rlct_smoke",
+  "batch_size": 2,
+  "block_size": 128,
+  "num_batches": 4,
+  "chains": 1,
+  "steps": 30,
+  "burn": 10,
+  "eval_every": 10,
+  "step_size": 1e-09,
+  "local_radius": 0.03,
+  "seed": 4242,
+  "n_tokens": 1024,
+  "beta": 0.14426950408889633
+}

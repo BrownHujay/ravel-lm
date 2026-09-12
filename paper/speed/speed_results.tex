@@ -1,0 +1,23 @@
+\subsection{Speed scaling}
+
+We report synthetic-token train-step timings to isolate the runtime behavior of the sequence operators from corpus effects. The benchmark uses the same byte-level configuration as the small TinyStories comparison and matches the attention baseline by trainable parameter count. Warmup/compile steps are excluded from the medians. The context-length sweep keeps approximately 1024 tokens per step while increasing $T$, so the main changing variable is the amount of history visible to each token.
+
+The crossover is sharp. At $T=128$, compiled RAVEL and attention are close (1.13$\times$ RAVEL/attention throughput). At $T=512$, RAVEL reaches 132k tokens/s versus 62k for attention (2.13$\times$). At $T=1024$, the gap grows to 3.94$\times$. This is the regime in which the event-memory formulation begins to express its intended scaling advantage: RAVEL's measured step time remains nearly flat while the attention baseline pays for a growing causal score/value computation.
+
+The fixed-context sweep checks that the effect is not only a single-batch artifact. At $T=512$, increasing the batch from 1 to 4 raises the compiled RAVEL advantage from 1.74$\times$ to 2.62$\times$. Thus the speedup persists when the number of tokens per step increases, not merely when the context sweep reduces batch size.
+
+There is one non-monotone point worth keeping rather than smoothing away: at $T=256$, compiled attention is faster in this CPU/PyTorch setup. This reflects implementation constants and compiler choices, not the asymptotic behavior. The result should therefore be stated as a crossover claim: RAVEL is not universally faster at tiny contexts, but it becomes substantially faster once the context is long enough for attention's quadratic term to dominate.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{fig_context_crossover.pdf}
+  \caption{Runtime crossover under a constant-token context sweep. The benchmark holds $B T \approx 1024$ and increases $T$. RAVEL is near parity at short contexts, but reaches 2.13$\times$ attention throughput at $T=512$ and 3.94$\times$ at $T=1024$ in compiled mode.}
+  \label{fig:ravel-context-speed}
+\end{figure}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{fig_fixed_t_scaling.pdf}
+  \caption{Fixed-context throughput at $T=512$. As more tokens are packed into each training step, RAVEL's advantage grows rather than disappearing, reaching 2.62$\times$ attention throughput at 2048 tokens/step in compiled mode.}
+  \label{fig:ravel-token-speed}
+\end{figure}

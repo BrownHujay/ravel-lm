@@ -1,0 +1,16 @@
+{
+  "run_dir": "runs/tinystories_comparison_200k_compiled_speedfix",
+  "out_dir": "paper/full/rlct",
+  "batch_size": 2,
+  "block_size": 128,
+  "num_batches": 8,
+  "chains": 3,
+  "steps": 260,
+  "burn": 100,
+  "eval_every": 10,
+  "step_size": 5e-09,
+  "local_radius": 0.03,
+  "seed": 4242,
+  "n_tokens": 2048,
+  "beta": 0.1311540946262694
+}

@@ -1,0 +1,44 @@
+\documentclass[10pt]{article}
+
+\usepackage[margin=0.8in]{geometry}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{hyperref}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=black,
+  citecolor=black,
+  urlcolor=blue
+}
+
+\title{\vspace{-1.5em}RAVEL Speed Scaling Evidence}
+\author{}
+\date{}
+\setcounter{secnumdepth}{0}
+
+\begin{document}
+\maketitle
+\vspace{-2.5em}
+
+\input{speed_results.tex}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.82\linewidth]{fig_attention_pressure.pdf}
+  \caption{Attention's causal score tensor grows quadratically with context length. In the context sweep, $BT$ is held near 1024, so the increase comes from $T$ itself rather than from simply processing more tokens per step.}
+  \label{fig:attention-pressure}
+\end{figure}
+
+\begin{table}[t]
+  \centering
+  \caption{Measured RAVEL throughput relative to the matched softmax-attention baseline. Values above 1 indicate RAVEL is faster.}
+  \label{tab:ravel-speedup}
+  \input{speedup_table.tex}
+\end{table}
+
+\end{document}
