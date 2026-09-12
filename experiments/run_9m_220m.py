@@ -20,6 +20,7 @@ from ravel_lm.runtime import FlatAdamW
 from experiments.chinchilla_suite import ChimeV2MemoryLayer
 
 DEV = torch.device("cuda")
+EAGER = False  # set True to skip HIP graph capture (reliable in detached/no-TTY runs)
 T = 2048
 LR = 3.5e-4
 TRAIN = ROOT / "runs/fineweb_edu_3m_15m_ctx2048/train_corpus.txt"
@@ -93,7 +94,10 @@ def run_arm(arm, steps, train_tok, eval_tok, offsets, eval_offsets, chunk=0):
 
     load(train_tok, int(offsets[0]))
     graphed = True
+    if EAGER:
+        graphed = False
     try:
+      if not EAGER:
         s = torch.cuda.Stream(); s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
             for _ in range(5):
@@ -167,7 +171,10 @@ def main():
     ap.add_argument("--smoke", type=int, default=0)
     ap.add_argument("--chunk", type=int, default=0)
     ap.add_argument("--one-chunk", action="store_true")
+    ap.add_argument("--eager", action="store_true")
     args = ap.parse_args()
+    global EAGER
+    EAGER = args.eager
     steps = args.smoke if args.smoke else args.tokens // T
     train_tok = load_bytes(TRAIN); eval_tok = load_bytes(EVAL)
     rng = np.random.default_rng(2026)
