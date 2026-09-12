@@ -55,14 +55,29 @@ def flush_deferred() -> None:
         return
     groups = {}
     for weight, x, gy in _STASH:
-        groups.setdefault(tuple(weight.shape), []).append((weight, x, gy))
+        if isinstance(weight, (list, tuple)):
+            key = ("packed",) + tuple(w.shape[0] for w in weight) + (weight[0].shape[1],)
+        else:
+            key = tuple(weight.shape)
+        groups.setdefault(key, []).append((weight, x, gy))
     _STASH.clear()
-    for shape, items in groups.items():
+    for key, items in groups.items():
         xs = torch.stack([x.reshape(-1, x.shape[-1]) for _, x, _ in items])
         gys = torch.stack([gy.reshape(-1, gy.shape[-1]) for _, _, gy in items])
-        dws = torch.bmm(gys.transpose(1, 2), xs)  # [N, out, in]
+        dws = torch.bmm(gys.transpose(1, 2), xs)  # [N, out_total, in]
         for (weight, _, _), dw in zip(items, dws):
-            if weight.grad is None:
+            if isinstance(weight, (list, tuple)):
+                row = 0
+                for w in weight:
+                    n = w.shape[0]
+                    if w.requires_grad:
+                        piece = dw[row : row + n]
+                        if w.grad is None:
+                            w.grad = piece.clone()
+                        else:
+                            w.grad.add_(piece)
+                    row += n
+            elif weight.grad is None:
                 weight.grad = dw.clone()
             else:
                 weight.grad.add_(dw)

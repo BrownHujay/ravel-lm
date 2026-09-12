@@ -109,6 +109,9 @@ class FlatAdamW:
 
     @torch.no_grad()
     def clip_grad_norm_(self, max_norm: float) -> torch.Tensor:
+        from .deferred import flush_deferred
+
+        flush_deferred()  # no-op unless deferred weight grads are pending
         # torch.dot is ~12x faster than aten::linalg_vector_norm on MPS for
         # large 1-D buffers and computes the same sum of squares.
         sq = self._flat_grads[0].dot(self._flat_grads[0])
@@ -121,6 +124,9 @@ class FlatAdamW:
         return total_norm
 
     def step(self) -> None:
+        from .deferred import flush_deferred
+
+        flush_deferred()  # safety net when clipping is disabled
         self._inner.step()
 
     def state_dict(self) -> dict:

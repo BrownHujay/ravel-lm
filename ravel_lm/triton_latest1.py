@@ -28,15 +28,25 @@ Tensor = torch.Tensor
 if _HAS_TRITON:
 
     @triton.jit
+    def _write_keys_kernel(addr_ptr, keys_ptr, N, T, C, A, BLOCK: tl.constexpr):
+        offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < N
+        addr = tl.load(addr_ptr + offs, mask=mask, other=0)
+        t = (offs // C) % T
+        bc = (offs // (T * C)) * C + offs % C
+        tl.store(keys_ptr + offs, (bc * A + addr) * (T + 1) + t, mask=mask)
+
+    @triton.jit
     def _search_gather_kernel(
-        sorted_keys_ptr, order_ptr, read_base_ptr, payload_ptr,
+        sorted_keys_ptr, order_ptr, read_addr_ptr, payload_ptr,
         out_ptr, src_ptr, mask_ptr,
-        N, D, Tplus1, T, C,
+        N, D, Tplus1, T, C, A,
         BLOCK_D: tl.constexpr,
     ):
         gid = tl.program_id(0)  # one program per read element (b, t, c)
         t = (gid // C) % T
-        base = tl.load(read_base_ptr + gid)
+        bc = (gid // (T * C)) * C + gid % C
+        base = bc * A + tl.load(read_addr_ptr + gid)
         key = base * Tplus1 + t - 1
         lo = 0
         hi = N
@@ -98,15 +108,13 @@ class _Latest1V2(torch.autograd.Function):
         device = payloads.device
         N = B * T * C
 
-        group = (
-            torch.arange(B * C, device=device, dtype=torch.int32).view(B, 1, C)
-            * int(address_space)
-        )
-        write_base = group + write_addresses.to(torch.int32)
-        read_base = (group + read_addresses.to(torch.int32)).reshape(-1).contiguous()
-        times = torch.arange(T, device=device, dtype=torch.int32).view(1, T, 1)
-        sorted_keys, order = torch.sort((write_base * (T + 1) + times).reshape(-1))
+        wa = write_addresses.reshape(-1).to(torch.int32)
+        keys = torch.empty(N, device=device, dtype=torch.int32)
+        _write_keys_kernel[(triton.cdiv(N, 1024),)](
+            wa, keys, N, T, C, int(address_space), BLOCK=1024)
+        sorted_keys, order = torch.sort(keys)
         order = order.to(torch.int32)
+        ra = read_addresses.reshape(-1).to(torch.int32).contiguous()
 
         payload_flat = payloads.reshape(N, D).contiguous()
         out = payloads.new_empty(B, T, C, D)
@@ -114,8 +122,8 @@ class _Latest1V2(torch.autograd.Function):
         mask = torch.empty(N, device=device, dtype=torch.int8)
         BLOCK_D = max(16, triton.next_power_of_2(D))
         _search_gather_kernel[(N,)](
-            sorted_keys, order, read_base, payload_flat, out, src, mask,
-            N, D, T + 1, T, C, BLOCK_D=BLOCK_D,
+            sorted_keys, order, ra, payload_flat, out, src, mask,
+            N, D, T + 1, T, C, int(address_space), BLOCK_D=BLOCK_D,
         )
         ctx.save_for_backward(src)
         ctx.payload_shape = (B, T, C, D)

@@ -9,6 +9,8 @@ import torch.nn.functional as F
 
 from .config import RavelConfig
 from .ravel_memory import RavelLayerCache, causal_last_k_lookup, causal_sum_lookup
+from .triton_block import fast_linear, fast_linear_packed, gate_residual, rms_norm, silu_gate
+from .triton_fusedblock import fused_ffn, fused_memory, fused_memory_ok, fused_mixer, fused_ok
 from .triton_local import can_use_triton_local_gate, triton_local_gate
 from .triton_memory import can_use_triton_fused_latest1, triton_fused_latest1_linear
 
@@ -34,7 +36,7 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: Tensor) -> Tensor:
-        return F.rms_norm(x, (self.weight.numel(),), self.weight, self.eps)
+        return rms_norm(x, self.weight, self.eps)
 
 
 class CausalDepthwiseConv1d(nn.Module):
@@ -95,7 +97,12 @@ class LocalMixer(nn.Module):
         self.use_mps_local = True
 
     def forward(self, x: Tensor) -> Tensor:
-        uv = self.in_proj(self.norm(x))
+        if (x.is_cuda and x.dtype == torch.float32 and self.dropout.p == 0.0
+                and fused_ok(self.conv.kernel_size, x.shape[-1])):
+            return fused_mixer(x, self.norm.weight, self.in_proj.weight,
+                               self.conv.weight, self.conv.bias,
+                               self.out_proj.weight, self.norm.eps)
+        uv = fast_linear(self.norm(x), self.in_proj.weight)
         if self.conv.kernel_size == 7 and can_use_triton_local_gate(uv, self.conv.weight):
             y = triton_local_gate(uv, self.conv.weight, self.conv.bias)
         elif (self.use_mps_local and local_gate is not None and uv.device.type == "mps"
@@ -105,7 +112,7 @@ class LocalMixer(nn.Module):
             u, v = uv.chunk(2, dim=-1)
             u = self.conv(u)
             y = F.silu(u) * v
-        return x + self.dropout(self.out_proj(y))
+        return x + self.dropout(fast_linear(y, self.out_proj.weight))
 
     def init_state(self, batch_size: int, *, device: torch.device | str, dtype: torch.dtype) -> Tensor:
         return self.conv.init_state(batch_size, device=device, dtype=dtype)
@@ -128,9 +135,11 @@ class SwiGLUFFN(nn.Module):
         self.dropout = nn.Dropout(cfg.dropout)
 
     def forward(self, x: Tensor) -> Tensor:
-        a, b = self.w12(self.norm(x)).chunk(2, dim=-1)
-        y = F.silu(a) * b
-        return x + self.dropout(self.w3(y))
+        if x.is_cuda and x.dtype == torch.float32 and self.dropout.p == 0.0:
+            return fused_ffn(x, self.norm.weight, self.w12.weight,
+                             self.w3.weight, self.norm.eps)
+        y = silu_gate(fast_linear(self.norm(x), self.w12.weight))
+        return x + self.dropout(fast_linear(y, self.w3.weight))
 
     def step(self, x: Tensor) -> Tensor:
         a, b = self.w12(self.norm(x)).chunk(2, dim=-1)
@@ -317,7 +326,7 @@ class RavelMemoryLayer(nn.Module):
         if self.write_addr.proj is not None:
             weights.append(self.write_addr.proj.weight)
             weights.append(self.read_addr.proj.weight)
-        packed = F.linear(xn, torch.cat(weights, dim=0))
+        packed = fast_linear_packed(xn, weights)
         payload = packed[..., :n_pay].reshape(B, T, C, self.cfg.payload_dim)
         gate_lin = packed[..., n_pay : n_pay + n_gate] + self.gate.bias
 
@@ -374,9 +383,10 @@ class RavelMemoryLayer(nn.Module):
                 )
                 pieces.append(summed.reshape(B, T, -1))
             read_flat = torch.cat(pieces, dim=-1)
-            fused = self.fuse(read_flat)
-        gated = torch.sigmoid(gate_lin) * fused
-        return x + self.dropout(gated)
+            fused = fast_linear(read_flat, self.fuse.weight)
+        if self.dropout.p == 0.0:
+            return gate_residual(x, gate_lin, fused)
+        return x + self.dropout(torch.sigmoid(gate_lin) * fused)
 
     def init_cache(self, batch_size: int, *, device: torch.device | str, dtype: torch.dtype) -> RavelLayerCache:
         return RavelLayerCache.empty(
