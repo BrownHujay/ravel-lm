@@ -17,7 +17,56 @@ sys.path.insert(0, str(ROOT))
 from ravel_lm.config import RavelConfig
 from ravel_lm.model import RavelLM
 from ravel_lm.runtime import FlatAdamW
+from ravel_lm.model import RavelMemoryLayer, literal_addresses_from_tokens
+from ravel_lm.ravel_memory import causal_last_k_lookup
 from experiments.chinchilla_suite import ChimeV2MemoryLayer
+import torch.nn.functional as F
+import math as _math
+
+
+class ChimeFullMemoryLayer(RavelMemoryLayer):
+    """CHIME-X v2 age gate on top of FULL addressing (literal + learned heads).
+
+    Same age-gate mechanism as ChimeV2 (zero-init -> identity at start) but keeps
+    the learned product-code heads, so it works with n_learned_heads > 0."""
+
+    def forward(self, x, token_ids, write_mask=None, literal_addr=None):
+        B, Tt, D = x.shape
+        xn = self.norm(x)
+        C = self.cfg.n_memory_heads
+        P = self.cfg.payload_dim
+        payload = self.payload(xn).reshape(B, Tt, C, P)
+        gate_lin = self.gate(xn)
+        if literal_addr is None:
+            literal_addr = literal_addresses_from_tokens(
+                token_ids, address_space=self.cfg.address_space,
+                n_heads=self.cfg.n_literal_heads, bos_token_id=self.cfg.bos_token_id,
+            )
+        with torch.no_grad():
+            lw = self.write_addr(xn)
+            lr = self.read_addr(xn)
+        write_addr = torch.cat([literal_addr, lw], dim=-1)
+        read_addr = torch.cat([literal_addr, lr], dim=-1)
+        t_chan = torch.arange(Tt, device=x.device, dtype=payload.dtype).view(1, Tt, 1, 1).expand(B, Tt, C, 1)
+        payload_aug = torch.cat([payload, t_chan], dim=-1)
+        values, mask = causal_last_k_lookup(
+            write_addr, payload_aug, read_addr,
+            address_space=self.cfg.address_space, k=1, write_mask=write_mask,
+        )
+        values = values.squeeze(3)
+        retrieved = values[..., :P]
+        t_write = values[..., P]
+        m = mask.squeeze(3).to(retrieved.dtype)
+        t_read = torch.arange(Tt, device=x.device, dtype=retrieved.dtype).view(1, Tt, 1)
+        delta = (t_read - t_write).clamp_min(1.0)
+        u = torch.log2(1.0 + delta)
+        feats = torch.stack([
+            m, (delta <= 8).to(u.dtype) * m, (u / 12.0) * m, (u - u.floor()) * m,
+            torch.sin(2 * _math.pi * 0.5 * u) * m, torch.cos(2 * _math.pi * 0.5 * u) * m,
+        ], dim=-1)
+        age_gate = 1.0 + torch.tanh(self.age_proj(feats))
+        fused = self.fuse((retrieved * age_gate).reshape(B, Tt, -1))
+        return x + self.dropout(torch.sigmoid(gate_lin) * fused)
 
 DEV = torch.device("cuda")
 EAGER = False  # set True to skip HIP graph capture (reliable in detached/no-TTY runs)
@@ -29,22 +78,36 @@ OUT = Path(__file__).parent / "run_9m_220m_results.json"
 EVAL_WINDOWS = 32
 
 
+def _add_age_proj(model):
+    for b in model.blocks:
+        if b.memory is not None:
+            proj = torch.nn.Linear(6, 1, bias=False).to(DEV)
+            torch.nn.init.zeros_(proj.weight)
+            b.memory.age_proj = proj
+
+
 def build(arm):
     cfg = RavelConfig.from_json(ROOT / "configs/byte/ravel_3m_byte.json")
     cfg.block_size = T; cfg.batch_size = 1; cfg.d_model = 256; cfg.n_layers = 12
-    if arm == "nope_chimex":
+    if arm in ("nope_chimex", "nope_chimex_big"):
         cfg.n_learned_heads = 0
+    if arm == "nope_chimex_big":
+        # param-match to full3 (~9.08M): +1 layer + a small width bump.
+        cfg.n_layers = 13
     cfg.validate()
     torch.manual_seed(0)
     model = RavelLM(cfg).to(DEV)
-    if arm == "nope_chimex":
+    if arm in ("nope_chimex", "nope_chimex_big"):
         model.pos_emb.weight.data.zero_(); model.pos_emb.weight.requires_grad_(False)
         for b in model.blocks:
             if b.memory is not None:
                 b.memory.__class__ = ChimeV2MemoryLayer
-                proj = torch.nn.Linear(6, 1, bias=False).to(DEV)
-                torch.nn.init.zeros_(proj.weight)
-                b.memory.age_proj = proj
+        _add_age_proj(model)
+    elif arm == "full3_chimex":
+        for b in model.blocks:
+            if b.memory is not None:
+                b.memory.__class__ = ChimeFullMemoryLayer
+        _add_age_proj(model)
     return model, cfg
 
 
